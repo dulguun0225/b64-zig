@@ -68,58 +68,88 @@ pub inline fn decode_chunk(chunk_in: *[4]u8, chunk_out: *[3]u8) usize {
     return byte_count;
 }
 
-pub fn Cli(comptime is_encode: bool) type {
+const EncDecErr = error{InitializationError};
+
+pub fn EncDec(comptime is_encode: bool) type {
     const len_chunk_in = if (is_encode) 3 else 4;
     const len_chunk_out = if (is_encode) 4 else 3;
 
     return struct {
         chunk_in: [len_chunk_in]u8 = [_]u8{0} ** len_chunk_in,
         chunk_out: [len_chunk_out]u8 = [_]u8{0} ** len_chunk_out,
+        stderr: fs.File,
+        input_path: []const u8,
+        output_path: []const u8,
+        input: fs.File,
+        output: fs.File,
 
         const Self = @This();
 
-        pub fn run(self: *Self) void {
-            std.debug.print("is_encode={}", .{is_encode});
+        pub fn init() EncDecErr!Self {
             const stderr = io.getStdErr();
-            defer stderr.close();
-            var bw_stderr = io.bufferedWriter(stderr.writer());
-            const vt_writer_stderr = bw_stderr.writer();
+            errdefer stderr.close();
 
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
             const allocator = arena.allocator();
 
-            const args = std.process.argsAlloc(allocator) catch |e| {
+            var bw_stderr = io.bufferedWriter(stderr.writer());
+            defer bw_stderr.flush() catch {};
+            const vt_writer_stderr = bw_stderr.writer();
+
+            var args = std.process.argsWithAllocator(allocator) catch |e| {
                 vt_writer_stderr.print("Error while reading command line arguments: {}", .{e}) catch {};
-                return;
+                return EncDecErr.InitializationError;
+            };
+            defer args.deinit();
+
+            _ = args.next();
+
+            const input_path = if (args.next()) |p| p else {
+                vt_writer_stderr.print("First argument must be input file path", .{}) catch {};
+                return EncDecErr.InitializationError;
             };
 
-            const input = fs.cwd().openFile(args[1], .{ .mode = fs.File.OpenMode.read_only }) catch |e| {
-                vt_writer_stderr.print("Error while opening input file {s}. {}", .{ args[1], e }) catch {};
-                return;
+            const input = fs.cwd().openFile(input_path, .{ .mode = fs.File.OpenMode.read_only }) catch |e| {
+                vt_writer_stderr.print("Error while opening input file {s}. {}", .{ input_path, e }) catch {};
+                return EncDecErr.InitializationError;
             };
-            defer input.close();
-            var br_input = io.bufferedReader(input.reader());
-            const vt_reader_input = br_input.reader();
+            errdefer input.close();
 
-            const output = if (3 <= args.len) blk: {
-                const f = fs.cwd().createFile(args[2], .{
+            const output, const output_path = if (args.next()) |output_path| blk: {
+                const f = fs.cwd().createFile(output_path, .{
                     .truncate = true,
                     .read = true,
                 }) catch |e| {
-                    vt_writer_stderr.print("Error while opening output file {s}. {}", .{ args[2], e }) catch {};
-                    return;
+                    vt_writer_stderr.print("Error while opening output file {s}. {}", .{ output_path, e }) catch {};
+                    return EncDecErr.InitializationError;
                 };
-                break :blk f;
-            } else io.getStdOut();
-            defer output.close();
+                break :blk .{ f, output_path };
+            } else .{ io.getStdOut(), "stdout" };
+            errdefer output.close();
 
-            var bw_output = io.bufferedWriter(output.writer());
+            return Self{ .stderr = stderr, .input_path = input_path, .input = input, .output_path = output_path, .output = output };
+        }
+
+        pub fn deinit(self: *Self) void {
+            self.stderr.close();
+            self.input.close();
+            self.output.close();
+        }
+
+        pub fn run(self: *Self) void {
+            var bw_stderr = io.bufferedWriter(self.stderr.writer());
+            const vt_writer_stderr = bw_stderr.writer();
+
+            var br_input = io.bufferedReader(self.input.reader());
+            const vt_reader_input = br_input.reader();
+
+            var bw_output = io.bufferedWriter(self.output.writer());
             var vt_writer_output = bw_output.writer();
 
             while (true) {
                 const bytes_read = vt_reader_input.readAll(&self.chunk_in) catch |e| {
-                    vt_writer_stderr.print("Error while reading from input buffer for {s}. {}", .{ args[1], e }) catch {};
+                    vt_writer_stderr.print("Error while reading from input buffer for {s}. {}", .{ self.output_path, e }) catch {};
                     return;
                 };
                 if (bytes_read == 0) {
@@ -129,20 +159,20 @@ pub fn Cli(comptime is_encode: bool) type {
                 if (is_encode) {
                     encode_chunk(bytes_read, &self.chunk_in, &self.chunk_out);
                     _ = vt_writer_output.writeAll(&self.chunk_out) catch |e| {
-                        vt_writer_stderr.print("Error while writing to output buffer for {s}. {}", .{ args[1], e }) catch {};
+                        vt_writer_stderr.print("Error while writing to output buffer for {s}. {}", .{ self.output_path, e }) catch {};
                         return;
                     };
                 } else {
                     const decoded_bytes = decode_chunk(&self.chunk_in, &self.chunk_out);
                     _ = vt_writer_output.writeAll(self.chunk_out[0..decoded_bytes]) catch |e| {
-                        vt_writer_stderr.print("Error while writing to output buffer for {s}. {}", .{ args[1], e }) catch {};
+                        vt_writer_stderr.print("Error while writing to output buffer for {s}. {}", .{ self.output_path, e }) catch {};
                         return;
                     };
                 }
             }
 
             bw_output.flush() catch |e| {
-                vt_writer_stderr.print("Error while writing(flush) to output {s}. {}", .{ args[2], e }) catch {};
+                vt_writer_stderr.print("Error while writing(flush) to output {s}. {}", .{ self.input_path, e }) catch {};
             };
 
             bw_stderr.flush() catch {};

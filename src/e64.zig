@@ -1,6 +1,9 @@
-const Cli = @import("b64_zig_lib").Cli;
+const EncDec = @import("b64_zig_lib").EncDec;
 
-pub fn main() void {
-    var cli = Cli(true){};
+pub fn main() !void {
+    var cli = EncDec(true).init() catch {
+        return;
+    };
+    defer cli.deinit();
     cli.run();
 }
